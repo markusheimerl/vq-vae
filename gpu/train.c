@@ -28,12 +28,12 @@ int main(int argc, char* argv[]) {
     
     // Parameters
     const int input_dim = 32 * 32 * 3;
-    const int latent_dim = 2048;
+    const int latent_dim = 4096;
     const int hidden_dim = 8192;
-    const int num_codes = 256;
-    const int num_codebook_vectors = 2048;
-    const int batch_size = 128;
-    const float beta = 0.55f;
+    const int num_codes = 512; 
+    const int num_codebook_vectors = 8192;
+    const int batch_size = 256;
+    const float beta = 0.8f;
     
     // Load CIFAR-10 data
     unsigned char* cifar_images = NULL;
@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
     
     // Training parameters
     const int num_epochs = 300;
-    const float learning_rate = 0.0003f;
+    const float learning_rate = 0.00001f;
     const int num_batches = num_images / batch_size;
     
     // Allocate device memory for batch data
@@ -112,15 +112,15 @@ int main(int argc, char* argv[]) {
             update_weights_vqvae(vqvae, learning_rate);
             
             // Print progress
-            if (batch % 50 == 0) {
+            if (batch % 5 == 0) {
                 printf("Epoch [%d/%d], Batch [%d/%d], Recon: %.4f, Codebook: %.4f, Commit: %.4f, Total: %.4f\n",
                        epoch, num_epochs, batch, num_batches,
                        losses[0], losses[1], losses[2], losses[3]);
             }
             
             // Generate reconstructions periodically
-            if (batch > 0 && batch % 200 == 0) {
-                printf("\n--- Generating reconstructions (epoch %d, batch %d) ---\n", epoch, batch);
+            if (batch > 0 && batch % 100 == 0) {
+                printf("--- Generating reconstructions (epoch %d, batch %d) ---\n", epoch, batch);
                 
                 // Get reconstructions from decoder output
                 float* h_reconstructions = (float*)malloc(batch_size * input_dim * sizeof(float));
@@ -157,7 +157,6 @@ int main(int argc, char* argv[]) {
                 }
                 
                 free(h_reconstructions);
-                printf("--- End reconstruction ---\n\n");
             }
         }
         

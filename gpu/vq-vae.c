@@ -71,50 +71,75 @@ void free_vqvae(VQVAE* vqvae) {
 }
 
 // CUDA kernel for vector quantization - find nearest codebook entry
-__global__ static void quantize_kernel(float* quantized, int* indices, float* encoded, 
-                                       float* codebook, int batch_size, int num_codes, 
-                                       int code_dim, int num_codebook_vectors) {
+__global__ void quantize_kernel(float* quantized, int* indices, 
+                                      float* encoded, float* codebook,
+                                      int batch_size, int num_codes,
+                                      int code_dim, int num_codebook_vectors) {
     int batch_idx = blockIdx.x;
     int code_idx = blockIdx.y;
-    int d = threadIdx.x;
     
-    if (batch_idx >= batch_size || code_idx >= num_codes || d >= code_dim) return;
+    if (batch_idx >= batch_size || code_idx >= num_codes) return;
     
-    __shared__ int best_idx;
+    extern __shared__ float shared_mem[];
+    float* shared_enc = shared_mem;
+    float* shared_dists = &shared_mem[code_dim];
+    int* shared_indices = (int*)&shared_dists[blockDim.x];
     
-    // Each thread processes one dimension
-    float* enc_vec = &encoded[batch_idx * num_codes * code_dim + code_idx * code_dim];
-    
-    // Thread 0 finds the nearest codebook vector
-    if (d == 0) {
-        float min_dist = 1e30f;
-        int min_idx = 0;
-        
-        for (int k = 0; k < num_codebook_vectors; k++) {
-            float dist = 0.0f;
-            float* code_vec = &codebook[k * code_dim];
-            
-            for (int dim = 0; dim < code_dim; dim++) {
-                float diff = enc_vec[dim] - code_vec[dim];
-                dist += diff * diff;
-            }
-            
-            if (dist < min_dist) {
-                min_dist = dist;
-                min_idx = k;
-            }
-        }
-        
-        best_idx = min_idx;
-        indices[batch_idx * num_codes + code_idx] = min_idx;
+    // Load encoded vector to shared memory (coalesced)
+    int enc_offset = batch_idx * num_codes * code_dim + code_idx * code_dim;
+    for (int d = threadIdx.x; d < code_dim; d += blockDim.x) {
+        shared_enc[d] = encoded[enc_offset + d];
     }
-    
     __syncthreads();
     
-    // All threads copy the quantized vector
-    quantized[batch_idx * num_codes * code_dim + code_idx * code_dim + d] = 
-        codebook[best_idx * code_dim + d];
+    // Each thread handles multiple codebook entries
+    float min_dist = 1e30f;
+    int min_idx = 0;
+    
+    for (int k = threadIdx.x; k < num_codebook_vectors; k += blockDim.x) {
+        float dist = 0.0f;
+        
+        // Unrolled distance computation
+        #pragma unroll 8
+        for (int d = 0; d < code_dim; d++) {
+            float diff = shared_enc[d] - codebook[k * code_dim + d];
+            dist += diff * diff;
+        }
+        
+        if (dist < min_dist) {
+            min_dist = dist;
+            min_idx = k;
+        }
+    }
+    
+    // Store results in shared memory
+    shared_dists[threadIdx.x] = min_dist;
+    shared_indices[threadIdx.x] = min_idx;
+    __syncthreads();
+    
+    // Parallel reduction (tree-based)
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            if (shared_dists[threadIdx.x + stride] < shared_dists[threadIdx.x]) {
+                shared_dists[threadIdx.x] = shared_dists[threadIdx.x + stride];
+                shared_indices[threadIdx.x] = shared_indices[threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    
+    // Write result
+    if (threadIdx.x == 0) {
+        indices[batch_idx * num_codes + code_idx] = shared_indices[0];
+    }
+    
+    // All threads cooperate to write quantized vector
+    int best_idx = shared_indices[0];
+    for (int d = threadIdx.x; d < code_dim; d += blockDim.x) {
+        quantized[enc_offset + d] = codebook[best_idx * code_dim + d];
+    }
 }
+
 
 // CUDA kernel for VQ losses computation
 __global__ static void compute_vq_losses_kernel(float* encoded, float* quantized,
@@ -213,7 +238,8 @@ void forward_pass_vqvae(VQVAE* vqvae, float* d_input) {
     
     // Quantize (operates directly on encoder output)
     dim3 grid(vqvae->batch_size, vqvae->num_codes);
-    quantize_kernel<<<grid, vqvae->code_dim>>>(
+    int smem_size = vqvae->code_dim * sizeof(float) + 256 * (sizeof(float) + sizeof(int));
+    quantize_kernel<<<grid, 256, smem_size>>>(
         vqvae->d_quantized, vqvae->d_encoding_indices,
         vqvae->encoder->d_output, vqvae->d_codebook,
         vqvae->batch_size, vqvae->num_codes, 
@@ -315,7 +341,8 @@ void encode_vqvae(VQVAE* vqvae, float* d_input, int* h_indices) {
     forward_pass_mlp(vqvae->encoder, d_input);
     
     dim3 grid(vqvae->batch_size, vqvae->num_codes);
-    quantize_kernel<<<grid, vqvae->code_dim>>>(
+    int smem_size = vqvae->code_dim * sizeof(float) + 256 * (sizeof(float) + sizeof(int));
+    quantize_kernel<<<grid, 256, smem_size>>>(
         vqvae->d_quantized, vqvae->d_encoding_indices,
         vqvae->encoder->d_output, vqvae->d_codebook,
         vqvae->batch_size, vqvae->num_codes,
