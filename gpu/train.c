@@ -28,12 +28,12 @@ int main(int argc, char* argv[]) {
     
     // Parameters
     const int input_dim = 32 * 32 * 3;
-    const int latent_dim = 512;         // 64 codes × 8 dims
-    const int hidden_dim = 2048;
-    const int num_codes = 64;           // 8×8 spatial grid
-    const int num_codebook_vectors = 512;
+    const int latent_dim = 1024;         // 64 codes × 8 dims
+    const int hidden_dim = 4096;
+    const int num_codes = 128;           // 8×8 spatial grid
+    const int num_codebook_vectors = 1024;
     const int batch_size = 128;
-    const float beta = 0.25f;
+    const float beta = 0.5f;
     
     // Load CIFAR-10 data
     unsigned char* cifar_images = NULL;
@@ -72,7 +72,7 @@ int main(int argc, char* argv[]) {
     printf("Total parameters: ~%.1fM\n", (encoder_params + decoder_params + codebook_params) / 1e6f);
     
     // Training parameters
-    const int num_epochs = 100;
+    const int num_epochs = 300;
     const float learning_rate = 0.0003f;
     const int num_batches = num_images / batch_size;
     
