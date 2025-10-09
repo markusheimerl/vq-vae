@@ -28,12 +28,12 @@ int main(int argc, char* argv[]) {
     
     // Parameters
     const int input_dim = 32 * 32 * 3;
-    const int latent_dim = 1024;         // 64 codes × 8 dims
-    const int hidden_dim = 4096;
-    const int num_codes = 128;           // 8×8 spatial grid
-    const int num_codebook_vectors = 1024;
+    const int latent_dim = 2048;
+    const int hidden_dim = 8192;
+    const int num_codes = 256;
+    const int num_codebook_vectors = 2048;
     const int batch_size = 128;
-    const float beta = 0.5f;
+    const float beta = 0.55f;
     
     // Load CIFAR-10 data
     unsigned char* cifar_images = NULL;
