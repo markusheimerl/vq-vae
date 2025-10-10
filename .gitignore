@@ -57,3 +57,4 @@ dkms.conf
 *.bin
 cifar-10-*
 *.png
+screenlog*
