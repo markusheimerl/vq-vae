@@ -1,9 +1,7 @@
 #include "vq-vae.h"
 
 // Initialize VQ-VAE
-VQVAE* init_vqvae(int input_dim, int latent_dim, int hidden_dim, int num_codes, 
-                  int num_codebook_vectors, int batch_size, float beta,
-                  cublasLtHandle_t cublaslt_handle) {
+VQVAE* init_vqvae(int input_dim, int latent_dim, int hidden_dim, int num_codes, int num_codebook_vectors, int batch_size, float beta, cublasLtHandle_t cublaslt_handle) {
     VQVAE* vqvae = (VQVAE*)malloc(sizeof(VQVAE));
     
     vqvae->input_dim = input_dim;
@@ -48,8 +46,10 @@ VQVAE* init_vqvae(int input_dim, int latent_dim, int hidden_dim, int num_codes,
     // Allocate backward pass buffers
     CHECK_CUDA(cudaMalloc(&vqvae->d_grad_encoded, batch_size * latent_dim * sizeof(float)));
     
-    // Allocate loss buffer
+    // Allocate loss buffers
     CHECK_CUDA(cudaMalloc(&vqvae->d_loss_buffer, batch_size * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&vqvae->d_codebook_loss, sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&vqvae->d_commitment_loss, sizeof(float)));
     
     return vqvae;
 }
@@ -66,11 +66,13 @@ void free_vqvae(VQVAE* vqvae) {
     cudaFree(vqvae->d_encoding_indices);
     cudaFree(vqvae->d_grad_encoded);
     cudaFree(vqvae->d_loss_buffer);
+    cudaFree(vqvae->d_codebook_loss);
+    cudaFree(vqvae->d_commitment_loss);
     
     free(vqvae);
 }
 
-// CUDA kernel for vector quantization - find nearest codebook entry
+// CUDA kernel for vector quantization
 __global__ void quantize_kernel(float* quantized, int* indices, 
                                       float* encoded, float* codebook,
                                       int batch_size, int num_codes,
@@ -194,11 +196,8 @@ __global__ static void ema_update_accumulate_kernel(float* ema_sum, float* ema_c
     for (int b = 0; b < batch_size; b++) {
         for (int c = 0; c < num_codes; c++) {
             if (indices[b * num_codes + c] == k) {
-                if (d == 0) {
-                    atomicAdd(&ema_count[k], 1.0f);
-                }
-                atomicAdd(&ema_sum[k * code_dim + d], 
-                         encoded[b * num_codes * code_dim + c * code_dim + d]);
+                if (d == 0) atomicAdd(&ema_count[k], 1.0f);
+                atomicAdd(&ema_sum[k * code_dim + d], encoded[b * num_codes * code_dim + c * code_dim + d]);
             }
         }
     }
@@ -217,7 +216,7 @@ __global__ static void ema_update_finalize_kernel(float* codebook, float* ema_su
     codebook[k * code_dim + d] = ema_sum[k * code_dim + d] / count;
 }
 
-// CUDA kernel for codebook lookup (used in decode)
+// CUDA kernel for codebook lookup
 __global__ static void codebook_lookup_kernel(float* output, int* indices, float* codebook,
                                               int batch_size, int num_codes, int code_dim) {
     int batch_idx = blockIdx.x;
@@ -227,27 +226,40 @@ __global__ static void codebook_lookup_kernel(float* output, int* indices, float
     if (batch_idx >= batch_size || code_idx >= num_codes || d >= code_dim) return;
     
     int codebook_idx = indices[batch_idx * num_codes + code_idx];
-    output[batch_idx * num_codes * code_dim + code_idx * code_dim + d] = 
-        codebook[codebook_idx * code_dim + d];
+    output[batch_idx * num_codes * code_dim + code_idx * code_dim + d] = codebook[codebook_idx * code_dim + d];
 }
 
-// Forward pass
-void forward_pass_vqvae(VQVAE* vqvae, float* d_input) {
-    // Encode
+// Encode to indices
+void encode_vqvae(VQVAE* vqvae, float* d_input, int* d_indices) {
     forward_pass_mlp(vqvae->encoder, d_input);
     
-    // Quantize (operates directly on encoder output)
     dim3 grid(vqvae->batch_size, vqvae->num_codes);
     int smem_size = vqvae->code_dim * sizeof(float) + 256 * (sizeof(float) + sizeof(int));
     quantize_kernel<<<grid, 256, smem_size>>>(
-        vqvae->d_quantized, vqvae->d_encoding_indices,
+        vqvae->d_quantized, d_indices,
         vqvae->encoder->d_output, vqvae->d_codebook,
-        vqvae->batch_size, vqvae->num_codes, 
+        vqvae->batch_size, vqvae->num_codes,
         vqvae->code_dim, vqvae->num_codebook_vectors
+    );
+}
+
+// Decode from indices
+void decode_vqvae(VQVAE* vqvae, int* d_indices) {
+    // Lookup codebook vectors
+    dim3 grid(vqvae->batch_size, vqvae->num_codes);
+    codebook_lookup_kernel<<<grid, vqvae->code_dim>>>(
+        vqvae->d_quantized, d_indices, vqvae->d_codebook,
+        vqvae->batch_size, vqvae->num_codes, vqvae->code_dim
     );
     
     // Decode
     forward_pass_mlp(vqvae->decoder, vqvae->d_quantized);
+}
+
+// Forward pass
+void forward_pass_vqvae(VQVAE* vqvae, float* d_input) {
+    encode_vqvae(vqvae, d_input, vqvae->d_encoding_indices);
+    decode_vqvae(vqvae, vqvae->d_encoding_indices);
 }
 
 // Calculate losses
@@ -256,11 +268,8 @@ void calculate_losses_vqvae(VQVAE* vqvae, float* d_input, float* losses) {
     float recon_loss = calculate_loss_mlp(vqvae->decoder, d_input);
     
     // VQ losses
-    float *d_codebook_loss, *d_commitment_loss;
-    CHECK_CUDA(cudaMalloc(&d_codebook_loss, sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_commitment_loss, sizeof(float)));
-    CHECK_CUDA(cudaMemset(d_codebook_loss, 0, sizeof(float)));
-    CHECK_CUDA(cudaMemset(d_commitment_loss, 0, sizeof(float)));
+    CHECK_CUDA(cudaMemset(vqvae->d_codebook_loss, 0, sizeof(float)));
+    CHECK_CUDA(cudaMemset(vqvae->d_commitment_loss, 0, sizeof(float)));
     
     int total_elements = vqvae->batch_size * vqvae->latent_dim;
     int block_size = 256;
@@ -268,12 +277,12 @@ void calculate_losses_vqvae(VQVAE* vqvae, float* d_input, float* losses) {
     
     compute_vq_losses_kernel<<<num_blocks, block_size>>>(
         vqvae->encoder->d_output, vqvae->d_quantized,
-        d_codebook_loss, d_commitment_loss, total_elements
+        vqvae->d_codebook_loss, vqvae->d_commitment_loss, total_elements
     );
     
     float codebook_loss, commitment_loss;
-    CHECK_CUDA(cudaMemcpy(&codebook_loss, d_codebook_loss, sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(&commitment_loss, d_commitment_loss, sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&codebook_loss, vqvae->d_codebook_loss, sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&commitment_loss, vqvae->d_commitment_loss, sizeof(float), cudaMemcpyDeviceToHost));
     
     codebook_loss /= total_elements;
     commitment_loss /= total_elements;
@@ -282,15 +291,17 @@ void calculate_losses_vqvae(VQVAE* vqvae, float* d_input, float* losses) {
     losses[1] = codebook_loss;
     losses[2] = commitment_loss;
     losses[3] = recon_loss + codebook_loss + vqvae->beta * commitment_loss;
-    
-    CHECK_CUDA(cudaFree(d_codebook_loss));
-    CHECK_CUDA(cudaFree(d_commitment_loss));
+}
+
+// Zero gradients
+void zero_gradients_vqvae(VQVAE* vqvae) {
+    zero_gradients_mlp(vqvae->encoder);
+    zero_gradients_mlp(vqvae->decoder);
 }
 
 // Backward pass
 void backward_pass_vqvae(VQVAE* vqvae, float* d_input) {
     // Backward through decoder
-    zero_gradients_mlp(vqvae->decoder);
     backward_pass_mlp(vqvae->decoder, vqvae->d_quantized, vqvae->d_grad_encoded);
     
     // Straight-through estimator
@@ -299,15 +310,12 @@ void backward_pass_vqvae(VQVAE* vqvae, float* d_input) {
     int num_blocks = (total_elements + block_size - 1) / block_size;
     
     straight_through_gradient_kernel<<<num_blocks, block_size>>>(
-        vqvae->d_grad_encoded, vqvae->d_grad_encoded,
+        vqvae->encoder->d_grad_output, vqvae->d_grad_encoded,
         vqvae->encoder->d_output, vqvae->d_quantized,
         vqvae->beta, total_elements
     );
     
     // Backward through encoder
-    CHECK_CUDA(cudaMemcpy(vqvae->encoder->d_grad_output, vqvae->d_grad_encoded,
-                          total_elements * sizeof(float), cudaMemcpyDeviceToDevice));
-    zero_gradients_mlp(vqvae->encoder);
     backward_pass_mlp(vqvae->encoder, d_input, NULL);
 }
 
@@ -336,47 +344,6 @@ void update_weights_vqvae(VQVAE* vqvae, float learning_rate) {
     );
 }
 
-// Encode to indices
-void encode_vqvae(VQVAE* vqvae, float* d_input, int* h_indices) {
-    forward_pass_mlp(vqvae->encoder, d_input);
-    
-    dim3 grid(vqvae->batch_size, vqvae->num_codes);
-    int smem_size = vqvae->code_dim * sizeof(float) + 256 * (sizeof(float) + sizeof(int));
-    quantize_kernel<<<grid, 256, smem_size>>>(
-        vqvae->d_quantized, vqvae->d_encoding_indices,
-        vqvae->encoder->d_output, vqvae->d_codebook,
-        vqvae->batch_size, vqvae->num_codes,
-        vqvae->code_dim, vqvae->num_codebook_vectors
-    );
-    
-    CHECK_CUDA(cudaMemcpy(h_indices, vqvae->d_encoding_indices,
-                          vqvae->batch_size * vqvae->num_codes * sizeof(int),
-                          cudaMemcpyDeviceToHost));
-}
-
-// Decode from indices
-void decode_vqvae(VQVAE* vqvae, int* h_indices, float* h_output) {
-    // Copy indices to device
-    CHECK_CUDA(cudaMemcpy(vqvae->d_encoding_indices, h_indices,
-                          vqvae->batch_size * vqvae->num_codes * sizeof(int),
-                          cudaMemcpyHostToDevice));
-    
-    // Lookup codebook vectors
-    dim3 grid(vqvae->batch_size, vqvae->num_codes);
-    codebook_lookup_kernel<<<grid, vqvae->code_dim>>>(
-        vqvae->d_quantized, vqvae->d_encoding_indices, vqvae->d_codebook,
-        vqvae->batch_size, vqvae->num_codes, vqvae->code_dim
-    );
-    
-    // Decode
-    forward_pass_mlp(vqvae->decoder, vqvae->d_quantized);
-    
-    // Copy output
-    CHECK_CUDA(cudaMemcpy(h_output, vqvae->decoder->d_output,
-                          vqvae->batch_size * vqvae->input_dim * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-}
-
 // Save VQ-VAE
 void save_vqvae(VQVAE* vqvae, const char* filename) {
     FILE* file = fopen(filename, "wb");
@@ -397,18 +364,15 @@ void save_vqvae(VQVAE* vqvae, const char* filename) {
     // Save codebook
     int codebook_size = vqvae->num_codebook_vectors * vqvae->code_dim;
     float* h_codebook = (float*)malloc(codebook_size * sizeof(float));
-    CHECK_CUDA(cudaMemcpy(h_codebook, vqvae->d_codebook, 
-                          codebook_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_codebook, vqvae->d_codebook, codebook_size * sizeof(float), cudaMemcpyDeviceToHost));
     fwrite(h_codebook, sizeof(float), codebook_size, file);
     free(h_codebook);
     
     // Save EMA state
     float* h_ema_sum = (float*)malloc(codebook_size * sizeof(float));
     float* h_ema_count = (float*)malloc(vqvae->num_codebook_vectors * sizeof(float));
-    CHECK_CUDA(cudaMemcpy(h_ema_sum, vqvae->d_codebook_ema_sum,
-                          codebook_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_ema_count, vqvae->d_codebook_ema_count,
-                          vqvae->num_codebook_vectors * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_ema_sum, vqvae->d_codebook_ema_sum, codebook_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_ema_count, vqvae->d_codebook_ema_count, vqvae->num_codebook_vectors * sizeof(float), cudaMemcpyDeviceToHost));
     fwrite(h_ema_sum, sizeof(float), codebook_size, file);
     fwrite(h_ema_count, sizeof(float), vqvae->num_codebook_vectors, file);
     free(h_ema_sum);
@@ -465,8 +429,7 @@ VQVAE* load_vqvae(const char* filename, int custom_batch_size, cublasLtHandle_t 
     int codebook_size = num_codebook_vectors * vqvae->code_dim;
     float* h_codebook = (float*)malloc(codebook_size * sizeof(float));
     fread(h_codebook, sizeof(float), codebook_size, file);
-    CHECK_CUDA(cudaMemcpy(vqvae->d_codebook, h_codebook,
-                          codebook_size * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(vqvae->d_codebook, h_codebook, codebook_size * sizeof(float), cudaMemcpyHostToDevice));
     free(h_codebook);
     
     // Load EMA state
@@ -474,10 +437,8 @@ VQVAE* load_vqvae(const char* filename, int custom_batch_size, cublasLtHandle_t 
     float* h_ema_count = (float*)malloc(num_codebook_vectors * sizeof(float));
     fread(h_ema_sum, sizeof(float), codebook_size, file);
     fread(h_ema_count, sizeof(float), num_codebook_vectors, file);
-    CHECK_CUDA(cudaMemcpy(vqvae->d_codebook_ema_sum, h_ema_sum,
-                          codebook_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(vqvae->d_codebook_ema_count, h_ema_count,
-                          num_codebook_vectors * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(vqvae->d_codebook_ema_sum, h_ema_sum, codebook_size * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(vqvae->d_codebook_ema_count, h_ema_count, num_codebook_vectors * sizeof(float), cudaMemcpyHostToDevice));
     free(h_ema_sum);
     free(h_ema_count);
     

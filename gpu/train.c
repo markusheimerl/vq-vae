@@ -62,8 +62,7 @@ int main(int argc, char* argv[]) {
         vqvae = load_vqvae(argv[1], batch_size, cublaslt_handle);
     } else {
         printf("Initializing new VQ-VAE...\n");
-        vqvae = init_vqvae(input_dim, latent_dim, hidden_dim, num_codes,
-                          num_codebook_vectors, batch_size, beta, cublaslt_handle);
+        vqvae = init_vqvae(input_dim, latent_dim, hidden_dim, num_codes, num_codebook_vectors, batch_size, beta, cublaslt_handle);
     }
     
     int encoder_params = input_dim * hidden_dim + hidden_dim * latent_dim;
@@ -72,7 +71,7 @@ int main(int argc, char* argv[]) {
     printf("Total parameters: ~%.1fM\n", (encoder_params + decoder_params + codebook_params) / 1e6f);
     
     // Training parameters
-    const int num_epochs = 300;
+    const int num_epochs = 600;
     const float learning_rate = 0.00001f;
     const int num_batches = num_images / batch_size;
     
@@ -91,9 +90,7 @@ int main(int argc, char* argv[]) {
             int batch_offset = batch * batch_size * input_dim;
             
             // Copy batch to device
-            CHECK_CUDA(cudaMemcpy(d_batch_images, &normalized_images[batch_offset],
-                                  batch_size * input_dim * sizeof(float),
-                                  cudaMemcpyHostToDevice));
+            CHECK_CUDA(cudaMemcpy(d_batch_images, &normalized_images[batch_offset], batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice));
             
             // Forward pass
             forward_pass_vqvae(vqvae, d_batch_images);
@@ -108,6 +105,7 @@ int main(int argc, char* argv[]) {
             epoch_total_loss += losses[3];
             
             // Backward pass and update
+            zero_gradients_vqvae(vqvae);
             backward_pass_vqvae(vqvae, d_batch_images);
             update_weights_vqvae(vqvae, learning_rate);
             
@@ -124,9 +122,7 @@ int main(int argc, char* argv[]) {
                 
                 // Get reconstructions from decoder output
                 float* h_reconstructions = (float*)malloc(batch_size * input_dim * sizeof(float));
-                CHECK_CUDA(cudaMemcpy(h_reconstructions, vqvae->decoder->d_output,
-                                      batch_size * input_dim * sizeof(float),
-                                      cudaMemcpyDeviceToHost));
+                CHECK_CUDA(cudaMemcpy(h_reconstructions, vqvae->decoder->d_output, batch_size * input_dim * sizeof(float), cudaMemcpyDeviceToHost));
                 
                 // Save a few examples
                 for (int i = 0; i < 3; i++) {
@@ -144,10 +140,8 @@ int main(int argc, char* argv[]) {
                     }
                     
                     char orig_filename[256], recon_filename[256];
-                    snprintf(orig_filename, sizeof(orig_filename),
-                            "original_epoch_%d_batch_%d_sample_%d.png", epoch, batch, i);
-                    snprintf(recon_filename, sizeof(recon_filename),
-                            "reconstructed_epoch_%d_batch_%d_sample_%d.png", epoch, batch, i);
+                    snprintf(orig_filename, sizeof(orig_filename), "original_epoch_%d_batch_%d_sample_%d.png", epoch, batch, i);
+                    snprintf(recon_filename, sizeof(recon_filename), "reconstructed_epoch_%d_batch_%d_sample_%d.png", epoch, batch, i);
                     
                     save_cifar10_image_png(orig_img, orig_filename);
                     save_cifar10_image_png(recon_img, recon_filename);
