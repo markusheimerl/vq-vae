@@ -32,7 +32,6 @@ typedef struct {
     
     // Loss computation buffers
     float* d_loss_buffer;        // [batch_size] - reusable
-    float* d_codebook_loss;      // [1]
     float* d_commitment_loss;    // [1]
     
     // Dimensions

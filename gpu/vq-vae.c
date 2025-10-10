@@ -48,7 +48,6 @@ VQVAE* init_vqvae(int input_dim, int latent_dim, int hidden_dim, int num_codes, 
     
     // Allocate loss buffers
     CHECK_CUDA(cudaMalloc(&vqvae->d_loss_buffer, batch_size * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&vqvae->d_codebook_loss, sizeof(float)));
     CHECK_CUDA(cudaMalloc(&vqvae->d_commitment_loss, sizeof(float)));
     
     return vqvae;
@@ -66,7 +65,6 @@ void free_vqvae(VQVAE* vqvae) {
     cudaFree(vqvae->d_encoding_indices);
     cudaFree(vqvae->d_grad_encoded);
     cudaFree(vqvae->d_loss_buffer);
-    cudaFree(vqvae->d_codebook_loss);
     cudaFree(vqvae->d_commitment_loss);
     
     free(vqvae);
@@ -143,23 +141,14 @@ __global__ void quantize_kernel(float* quantized, int* indices,
 }
 
 
-// CUDA kernel for VQ losses computation
-__global__ static void compute_vq_losses_kernel(float* encoded, float* quantized,
-                                                float* codebook_loss, float* commitment_loss,
-                                                int size) {
+// CUDA kernel for commitment loss computation
+__global__ static void compute_commitment_loss_kernel(float* encoded, float* quantized,
+                                                       float* commitment_loss, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     
-    float enc = encoded[idx];
-    float quant = quantized[idx];
-    float diff = enc - quant;
-    float sq_diff = diff * diff;
-    
-    // Codebook loss: ||sg[z_e] - e||² (gradient flows to codebook)
-    atomicAdd(codebook_loss, sq_diff);
-    
-    // Commitment loss: ||z_e - sg[e]||² (gradient flows to encoder)
-    atomicAdd(commitment_loss, sq_diff);
+    float diff = encoded[idx] - quantized[idx];
+    atomicAdd(commitment_loss, diff * diff);
 }
 
 // CUDA kernel for straight-through gradient
@@ -175,24 +164,22 @@ __global__ static void straight_through_gradient_kernel(float* grad_encoded,
 }
 
 // CUDA kernel for EMA codebook update
-__global__ static void ema_update_accumulate_kernel(float* ema_sum, float* ema_count,
-                                                    int* indices, float* encoded,
-                                                    int batch_size, int num_codes,
-                                                    int code_dim, float decay) {
+__global__ static void ema_update_kernel(float* codebook, float* ema_sum, float* ema_count,
+                                         int* indices, float* encoded,
+                                         int batch_size, int num_codes, int code_dim,
+                                         float decay, float epsilon) {
     int k = blockIdx.x;
     int d = threadIdx.x;
     
     if (d >= code_dim) return;
     
-    // Decay previous EMA
-    if (d == 0) {
-        ema_count[k] *= decay;
-    }
+    // Step 1: Decay previous EMA
+    if (d == 0) ema_count[k] *= decay;
     ema_sum[k * code_dim + d] *= decay;
     
     __syncthreads();
     
-    // Accumulate new values
+    // Step 2: Accumulate new values
     for (int b = 0; b < batch_size; b++) {
         for (int c = 0; c < num_codes; c++) {
             if (indices[b * num_codes + c] == k) {
@@ -201,17 +188,10 @@ __global__ static void ema_update_accumulate_kernel(float* ema_sum, float* ema_c
             }
         }
     }
-}
-
-// CUDA kernel for EMA codebook finalization
-__global__ static void ema_update_finalize_kernel(float* codebook, float* ema_sum,
-                                                  float* ema_count, int num_codebook_vectors,
-                                                  int code_dim, float epsilon) {
-    int k = blockIdx.x;
-    int d = threadIdx.x;
     
-    if (k >= num_codebook_vectors || d >= code_dim) return;
+    __syncthreads();
     
+    // Step 3: Update codebook
     float count = ema_count[k] + epsilon;
     codebook[k * code_dim + d] = ema_sum[k * code_dim + d] / count;
 }
@@ -267,30 +247,25 @@ void calculate_losses_vqvae(VQVAE* vqvae, float* d_input, float* losses) {
     // Reconstruction loss
     float recon_loss = calculate_loss_mlp(vqvae->decoder, d_input);
     
-    // VQ losses
-    CHECK_CUDA(cudaMemset(vqvae->d_codebook_loss, 0, sizeof(float)));
+    // Commitment loss
     CHECK_CUDA(cudaMemset(vqvae->d_commitment_loss, 0, sizeof(float)));
     
     int total_elements = vqvae->batch_size * vqvae->latent_dim;
     int block_size = 256;
     int num_blocks = (total_elements + block_size - 1) / block_size;
     
-    compute_vq_losses_kernel<<<num_blocks, block_size>>>(
+    compute_commitment_loss_kernel<<<num_blocks, block_size>>>(
         vqvae->encoder->d_output, vqvae->d_quantized,
-        vqvae->d_codebook_loss, vqvae->d_commitment_loss, total_elements
+        vqvae->d_commitment_loss, total_elements
     );
     
-    float codebook_loss, commitment_loss;
-    CHECK_CUDA(cudaMemcpy(&codebook_loss, vqvae->d_codebook_loss, sizeof(float), cudaMemcpyDeviceToHost));
+    float commitment_loss;
     CHECK_CUDA(cudaMemcpy(&commitment_loss, vqvae->d_commitment_loss, sizeof(float), cudaMemcpyDeviceToHost));
-    
-    codebook_loss /= total_elements;
     commitment_loss /= total_elements;
     
     losses[0] = recon_loss;
-    losses[1] = codebook_loss;
-    losses[2] = commitment_loss;
-    losses[3] = recon_loss + codebook_loss + vqvae->beta * commitment_loss;
+    losses[1] = commitment_loss;
+    losses[2] = recon_loss + vqvae->beta * commitment_loss;
 }
 
 // Zero gradients
@@ -326,21 +301,11 @@ void update_weights_vqvae(VQVAE* vqvae, float learning_rate) {
     update_weights_mlp(vqvae->decoder, learning_rate);
     
     // EMA update for codebook
-    dim3 grid(vqvae->num_codebook_vectors);
-    
-    // Accumulate with decay
-    ema_update_accumulate_kernel<<<grid, vqvae->code_dim>>>(
-        vqvae->d_codebook_ema_sum, vqvae->d_codebook_ema_count,
+    ema_update_kernel<<<vqvae->num_codebook_vectors, vqvae->code_dim>>>(
+        vqvae->d_codebook, vqvae->d_codebook_ema_sum, vqvae->d_codebook_ema_count,
         vqvae->d_encoding_indices, vqvae->encoder->d_output,
         vqvae->batch_size, vqvae->num_codes, vqvae->code_dim,
-        vqvae->ema_decay
-    );
-    
-    // Update codebook
-    ema_update_finalize_kernel<<<grid, vqvae->code_dim>>>(
-        vqvae->d_codebook, vqvae->d_codebook_ema_sum,
-        vqvae->d_codebook_ema_count, vqvae->num_codebook_vectors,
-        vqvae->code_dim, vqvae->epsilon
+        vqvae->ema_decay, vqvae->epsilon
     );
 }
 
@@ -388,9 +353,7 @@ void save_vqvae(VQVAE* vqvae, const char* filename) {
     base_filename[sizeof(base_filename) - 1] = '\0';
     
     char* dot_pos = strrchr(base_filename, '.');
-    if (dot_pos && strcmp(dot_pos, ".bin") == 0) {
-        *dot_pos = '\0';
-    }
+    if (dot_pos && strcmp(dot_pos, ".bin") == 0) *dot_pos = '\0';
     
     snprintf(encoder_filename, sizeof(encoder_filename), "%s_encoder.bin", base_filename);
     snprintf(decoder_filename, sizeof(decoder_filename), "%s_decoder.bin", base_filename);
@@ -422,8 +385,7 @@ VQVAE* load_vqvae(const char* filename, int custom_batch_size, cublasLtHandle_t 
     
     int batch_size = (custom_batch_size > 0) ? custom_batch_size : stored_batch_size;
     
-    VQVAE* vqvae = init_vqvae(input_dim, latent_dim, hidden_dim, num_codes,
-                              num_codebook_vectors, batch_size, beta, cublaslt_handle);
+    VQVAE* vqvae = init_vqvae(input_dim, latent_dim, hidden_dim, num_codes, num_codebook_vectors, batch_size, beta, cublaslt_handle);
     
     // Load codebook
     int codebook_size = num_codebook_vectors * vqvae->code_dim;
@@ -452,9 +414,7 @@ VQVAE* load_vqvae(const char* filename, int custom_batch_size, cublasLtHandle_t 
     base_filename[sizeof(base_filename) - 1] = '\0';
     
     char* dot_pos = strrchr(base_filename, '.');
-    if (dot_pos && strcmp(dot_pos, ".bin") == 0) {
-        *dot_pos = '\0';
-    }
+    if (dot_pos && strcmp(dot_pos, ".bin") == 0) *dot_pos = '\0';
     
     snprintf(encoder_filename, sizeof(encoder_filename), "%s_encoder.bin", base_filename);
     snprintf(decoder_filename, sizeof(decoder_filename), "%s_decoder.bin", base_filename);

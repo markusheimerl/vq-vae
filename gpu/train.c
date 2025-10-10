@@ -82,7 +82,6 @@ int main(int argc, char* argv[]) {
     // Training loop
     for (int epoch = 0; epoch < num_epochs; epoch++) {
         float epoch_recon_loss = 0.0f;
-        float epoch_codebook_loss = 0.0f;
         float epoch_commitment_loss = 0.0f;
         float epoch_total_loss = 0.0f;
         
@@ -96,13 +95,12 @@ int main(int argc, char* argv[]) {
             forward_pass_vqvae(vqvae, d_batch_images);
             
             // Calculate losses
-            float losses[4];
+            float losses[3];
             calculate_losses_vqvae(vqvae, d_batch_images, losses);
             
             epoch_recon_loss += losses[0];
-            epoch_codebook_loss += losses[1];
-            epoch_commitment_loss += losses[2];
-            epoch_total_loss += losses[3];
+            epoch_commitment_loss += losses[1];
+            epoch_total_loss += losses[2];
             
             // Backward pass and update
             zero_gradients_vqvae(vqvae);
@@ -111,9 +109,9 @@ int main(int argc, char* argv[]) {
             
             // Print progress
             if (batch % 5 == 0) {
-                printf("Epoch [%d/%d], Batch [%d/%d], Recon: %.4f, Codebook: %.4f, Commit: %.4f, Total: %.4f\n",
+                printf("Epoch [%d/%d], Batch [%d/%d], Recon: %.4f, Commit: %.4f, Total: %.4f\n",
                        epoch, num_epochs, batch, num_batches,
-                       losses[0], losses[1], losses[2], losses[3]);
+                       losses[0], losses[1], losses[2]);
             }
             
             // Generate reconstructions periodically
@@ -155,14 +153,12 @@ int main(int argc, char* argv[]) {
         }
         
         epoch_recon_loss /= num_batches;
-        epoch_codebook_loss /= num_batches;
         epoch_commitment_loss /= num_batches;
         epoch_total_loss /= num_batches;
         
         printf("========================================\n");
         printf("Epoch [%d/%d] Summary:\n", epoch, num_epochs);
         printf("  Reconstruction Loss:  %.4f\n", epoch_recon_loss);
-        printf("  Codebook Loss:        %.4f\n", epoch_codebook_loss);
         printf("  Commitment Loss:      %.4f\n", epoch_commitment_loss);
         printf("  Total Loss:           %.4f\n", epoch_total_loss);
         printf("========================================\n\n");
