@@ -53,38 +53,42 @@ typedef struct {
     Transformer* encoder;
     Transformer* decoder;
     
-    // Input/Output projections
-    float* d_input_proj_W;      // [input_dim x latent_dim]
-    float* d_input_proj_grad;
-    float* d_input_proj_m;
-    float* d_input_proj_v;
+    // Patch embedding projection
+    float* d_patch_proj_W;      // [patch_dim x d_model]
+    float* d_patch_proj_grad;
+    float* d_patch_proj_m;
+    float* d_patch_proj_v;
     
-    float* d_output_proj_W;     // [latent_dim x input_dim]
+    // Output projection (from patches back to pixels)
+    float* d_output_proj_W;     // [d_model x patch_dim]
     float* d_output_proj_grad;
     float* d_output_proj_m;
     float* d_output_proj_v;
     
     // Codebook parameters
-    float* d_codebook;           // [num_codebook_vectors x code_dim]
+    float* d_codebook;           // [num_codebook_vectors x d_model]
     
     // EMA for codebook updates
-    float* d_codebook_ema_sum;   // [num_codebook_vectors x code_dim]
+    float* d_codebook_ema_sum;   // [num_codebook_vectors x d_model]
     float* d_codebook_ema_count; // [num_codebook_vectors]
     float ema_decay;
     float epsilon;
     
     // Forward pass buffers
-    float* d_projected_input;    // [batch_size x latent_dim]
-    float* d_quantized;          // [batch_size x latent_dim]
-    float* d_decoder_input;      // [batch_size x seq_len x d_model]
-    float* d_reconstructed;      // [batch_size x input_dim]
-    int* d_encoding_indices;     // [batch_size x num_codes]
+    float* d_patches;            // [batch_size x num_patches x patch_dim]
+    float* d_patch_embeddings;   // [batch_size x num_patches x d_model]
+    float* d_quantized;          // [batch_size x num_patches x d_model]
+    float* d_decoder_input;      // [batch_size x num_patches x d_model]
+    float* d_reconstructed_patches; // [batch_size x num_patches x patch_dim]
+    float* d_reconstructed;      // [batch_size x img_height x img_width x 3]
+    int* d_encoding_indices;     // [batch_size x num_patches]
     
     // Backward pass buffers
-    float* d_grad_decoder_input;  // [batch_size x seq_len x d_model]
-    float* d_grad_encoder_input;  // [batch_size x seq_len x d_model]
-    float* d_grad_quantized;      // [batch_size x latent_dim]
-    float* d_grad_input;          // [batch_size x input_dim]
+    float* d_grad_decoder_input;  // [batch_size x num_patches x d_model]
+    float* d_grad_encoder_input;  // [batch_size x num_patches x d_model]
+    float* d_grad_quantized;      // [batch_size x num_patches x d_model]
+    float* d_grad_patches;        // [batch_size x num_patches x patch_dim]
+    float* d_grad_input;          // [batch_size x img_height x img_width x 3]
     
     // Loss computation buffers
     float* d_commitment_loss;    // [1]
@@ -95,14 +99,16 @@ typedef struct {
     float weight_decay;
     
     // Dimensions
-    int input_dim;               // 3072 for CIFAR-10
-    int latent_dim;              // num_codes * code_dim
-    int seq_len;                 // Number of sequence positions (= num_codes)
-    int d_model;                 // Dimension per position (= code_dim)
+    int img_height;              // 32 for CIFAR-10
+    int img_width;               // 32 for CIFAR-10
+    int img_channels;            // 3 for CIFAR-10
+    int patch_height;            // e.g., 4
+    int patch_width;             // e.g., 4
+    int num_patches;             // (img_height/patch_height) * (img_width/patch_width)
+    int patch_dim;               // patch_height * patch_width * img_channels
+    int d_model;                 // Transformer dimension
     int hidden_dim;              // Hidden dimension for transformers
     int num_layers;              // Number of transformer layers
-    int num_codes;               // Number of code positions
-    int code_dim;                // Dimension of each code
     int num_codebook_vectors;    // Size of codebook
     int batch_size;
     
@@ -112,14 +118,16 @@ typedef struct {
     // cuBLASLt handle and descriptors
     cublasLtHandle_t cublaslt_handle;
     cublasLtMatmulDesc_t matmul_desc;
-    cublasLtMatrixLayout_t input_layout;
-    cublasLtMatrixLayout_t latent_layout;
-    cublasLtMatrixLayout_t input_proj_weight_layout;
+    cublasLtMatrixLayout_t patch_proj_weight_layout;
     cublasLtMatrixLayout_t output_proj_weight_layout;
+    cublasLtMatrixLayout_t patches_layout;
+    cublasLtMatrixLayout_t embeddings_layout;
 } VQVAE;
 
 // Function prototypes
-VQVAE* init_vqvae(int input_dim, int latent_dim, int hidden_dim, int num_layers, int num_codes, int num_codebook_vectors, int batch_size, float beta, cublasLtHandle_t cublaslt_handle);
+VQVAE* init_vqvae(int img_height, int img_width, int img_channels, int patch_height, int patch_width,
+                  int d_model, int hidden_dim, int num_layers, int num_codebook_vectors, 
+                  int batch_size, float beta, cublasLtHandle_t cublaslt_handle);
 void free_vqvae(VQVAE* vqvae);
 void forward_pass_vqvae(VQVAE* vqvae, float* d_input);
 void calculate_losses_vqvae(VQVAE* vqvae, float* d_input, float* losses);

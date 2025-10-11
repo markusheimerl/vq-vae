@@ -27,14 +27,20 @@ int main(int argc, char* argv[]) {
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
     
     // Parameters
-    const int input_dim = 32 * 32 * 3;
-    const int latent_dim = 4096;
-    const int hidden_dim = 256;
-    const int num_layers = 2;
-    const int num_codes = 512; 
+    const int img_height = 32;
+    const int img_width = 32;
+    const int img_channels = 3;
+    const int patch_height = 4;
+    const int patch_width = 4;
+    const int d_model = 512;
+    const int hidden_dim = 2048;
+    const int num_layers = 12;
     const int num_codebook_vectors = 8192;
-    const int batch_size = 128;
+    const int batch_size = 256;
     const float beta = 0.25f;
+    
+    int num_patches = (img_height / patch_height) * (img_width / patch_width);
+    int patch_dim = patch_height * patch_width * img_channels;
     
     // Load CIFAR-10 data
     unsigned char* cifar_images = NULL;
@@ -52,6 +58,7 @@ int main(int argc, char* argv[]) {
     load_cifar10_data(&cifar_images, &cifar_labels, &num_images, batch_files, 5);
     
     // Normalize images to [-1, 1]
+    int input_dim = img_height * img_width * img_channels;
     float* normalized_images = (float*)malloc(num_images * input_dim * sizeof(float));
     for (int i = 0; i < num_images * input_dim; i++) {
         normalized_images[i] = (cifar_images[i] / 127.5f) - 1.0f;
@@ -62,35 +69,36 @@ int main(int argc, char* argv[]) {
         printf("Loading checkpoint: %s\n", argv[1]);
         vqvae = load_vqvae(argv[1], batch_size, cublaslt_handle);
     } else {
-        printf("Initializing new VQ-VAE with Transformer encoder/decoder...\n");
-        vqvae = init_vqvae(input_dim, latent_dim, hidden_dim, num_layers, num_codes, num_codebook_vectors, batch_size, beta, cublaslt_handle);
+        printf("Initializing new VQ-VAE with patch-based Transformer encoder/decoder...\n");
+        vqvae = init_vqvae(img_height, img_width, img_channels, patch_height, patch_width,
+                          d_model, hidden_dim, num_layers, num_codebook_vectors, 
+                          batch_size, beta, cublaslt_handle);
     }
     
-    int seq_len = num_codes;
-    int d_model = latent_dim / num_codes;
-    
     printf("Architecture:\n");
-    printf("  Input: [%d x %d] (32x32x3 CIFAR-10 images)\n", batch_size, input_dim);
-    printf("  Input projection: [%d x %d] -> [%d x %d]\n", batch_size, input_dim, batch_size, latent_dim);
-    printf("  Reshape to sequence: [%d x %d x %d]\n", batch_size, seq_len, d_model);
-    printf("  Positional encoding: sinusoidal, added to sequence\n");
+    printf("  Input: [%d x %d x %d x %d] (CIFAR-10 images)\n", batch_size, img_height, img_width, img_channels);
+    printf("  Patch size: %d x %d\n", patch_height, patch_width);
+    printf("  Number of patches: %d (%d x %d grid)\n", num_patches, img_height/patch_height, img_width/patch_width);
+    printf("  Patch dimension: %d (%d x %d x %d)\n", patch_dim, patch_height, patch_width, img_channels);
+    printf("  Patch projection: [%d x %d] -> [%d x %d]\n", batch_size * num_patches, patch_dim, batch_size * num_patches, d_model);
+    printf("  Positional encoding: sinusoidal, added to patch embeddings\n");
     printf("  Encoder: Transformer with %d layers, d_model=%d, hidden=%d\n", num_layers, d_model, hidden_dim);
-    printf("  Quantization: %d codes, %d codebook vectors, code_dim=%d\n", num_codes, num_codebook_vectors, d_model);
+    printf("  Quantization: %d patches, %d codebook vectors, d_model=%d\n", num_patches, num_codebook_vectors, d_model);
     printf("  Decoder: Transformer with %d layers, d_model=%d, hidden=%d\n", num_layers, d_model, hidden_dim);
-    printf("  Output projection: [%d x %d] -> [%d x %d]\n", batch_size, latent_dim, batch_size, input_dim);
+    printf("  Output projection: [%d x %d] -> [%d x %d]\n", batch_size * num_patches, d_model, batch_size * num_patches, patch_dim);
     
     // Count parameters
-    int proj_params = input_dim * latent_dim + latent_dim * input_dim;
+    int patch_proj_params = patch_dim * d_model + d_model * patch_dim;
     int encoder_attention_params = num_layers * 4 * d_model * d_model;
     int encoder_mlp_params = num_layers * (d_model * hidden_dim + hidden_dim * d_model);
     int decoder_attention_params = num_layers * 4 * d_model * d_model;
     int decoder_mlp_params = num_layers * (d_model * hidden_dim + hidden_dim * d_model);
     int codebook_params = num_codebook_vectors * d_model;
-    int total_params = proj_params + encoder_attention_params + encoder_mlp_params + 
+    int total_params = patch_proj_params + encoder_attention_params + encoder_mlp_params + 
                        decoder_attention_params + decoder_mlp_params + codebook_params;
     
     printf("Parameters:\n");
-    printf("  Projections: %.2fM\n", proj_params / 1e6f);
+    printf("  Patch projections: %.2fM\n", patch_proj_params / 1e6f);
     printf("  Encoder: %.2fM (attention: %.2fM, mlp: %.2fM)\n", 
            (encoder_attention_params + encoder_mlp_params) / 1e6f,
            encoder_attention_params / 1e6f, encoder_mlp_params / 1e6f);
@@ -138,7 +146,7 @@ int main(int argc, char* argv[]) {
             update_weights_vqvae(vqvae, learning_rate);
             
             // Print progress
-            if (batch % 10 == 0) {
+            if (batch % 2 == 0) {
                 printf("Epoch [%d/%d], Batch [%d/%d], Recon: %.4f, Commit: %.4f, Total: %.4f\n",
                        epoch, num_epochs, batch, num_batches,
                        losses[0], losses[1], losses[2]);
