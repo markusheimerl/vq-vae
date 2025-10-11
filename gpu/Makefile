@@ -6,11 +6,17 @@ ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda -Wno-unknown-cuda-version
 CUDALIBS = -L/usr/local/cuda/lib64 -lcudart -lcublas -lcublasLt
 
-train.out: vq-vae.o ../transformer/mlp/gpu/mlp.o ../data.o train.o
-	$(CC) vq-vae.o ../transformer/mlp/gpu/mlp.o ../data.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
+train.out: vq-vae.o ../transformer/gpu/transformer.o ../transformer/attention/gpu/attention.o ../transformer/mlp/gpu/mlp.o ../data.o train.o
+	$(CC) vq-vae.o ../transformer/gpu/transformer.o ../transformer/attention/gpu/attention.o ../transformer/mlp/gpu/mlp.o ../data.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
 
 vq-vae.o: vq-vae.c vq-vae.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c vq-vae.c -o $@
+
+../transformer/gpu/transformer.o:
+	$(MAKE) -C ../transformer/gpu transformer.o
+
+../transformer/attention/gpu/attention.o:
+	$(MAKE) -C ../transformer/attention/gpu attention.o
 
 ../transformer/mlp/gpu/mlp.o:
 	$(MAKE) -C ../transformer/mlp/gpu mlp.o

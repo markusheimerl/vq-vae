@@ -29,11 +29,12 @@ int main(int argc, char* argv[]) {
     // Parameters
     const int input_dim = 32 * 32 * 3;
     const int latent_dim = 4096;
-    const int hidden_dim = 8192;
+    const int hidden_dim = 256;
+    const int num_layers = 2;
     const int num_codes = 512; 
     const int num_codebook_vectors = 8192;
-    const int batch_size = 256;
-    const float beta = 0.8f;
+    const int batch_size = 128;
+    const float beta = 0.25f;
     
     // Load CIFAR-10 data
     unsigned char* cifar_images = NULL;
@@ -61,18 +62,47 @@ int main(int argc, char* argv[]) {
         printf("Loading checkpoint: %s\n", argv[1]);
         vqvae = load_vqvae(argv[1], batch_size, cublaslt_handle);
     } else {
-        printf("Initializing new VQ-VAE...\n");
-        vqvae = init_vqvae(input_dim, latent_dim, hidden_dim, num_codes, num_codebook_vectors, batch_size, beta, cublaslt_handle);
+        printf("Initializing new VQ-VAE with Transformer encoder/decoder...\n");
+        vqvae = init_vqvae(input_dim, latent_dim, hidden_dim, num_layers, num_codes, num_codebook_vectors, batch_size, beta, cublaslt_handle);
     }
     
-    int encoder_params = input_dim * hidden_dim + hidden_dim * latent_dim;
-    int decoder_params = latent_dim * hidden_dim + hidden_dim * input_dim;
-    int codebook_params = num_codebook_vectors * (latent_dim / num_codes);
-    printf("Total parameters: ~%.1fM\n", (encoder_params + decoder_params + codebook_params) / 1e6f);
+    int seq_len = num_codes;
+    int d_model = latent_dim / num_codes;
+    
+    printf("Architecture:\n");
+    printf("  Input: [%d x %d] (32x32x3 CIFAR-10 images)\n", batch_size, input_dim);
+    printf("  Input projection: [%d x %d] -> [%d x %d]\n", batch_size, input_dim, batch_size, latent_dim);
+    printf("  Reshape to sequence: [%d x %d x %d]\n", batch_size, seq_len, d_model);
+    printf("  Positional encoding: sinusoidal, added to sequence\n");
+    printf("  Encoder: Transformer with %d layers, d_model=%d, hidden=%d\n", num_layers, d_model, hidden_dim);
+    printf("  Quantization: %d codes, %d codebook vectors, code_dim=%d\n", num_codes, num_codebook_vectors, d_model);
+    printf("  Decoder: Transformer with %d layers, d_model=%d, hidden=%d\n", num_layers, d_model, hidden_dim);
+    printf("  Output projection: [%d x %d] -> [%d x %d]\n", batch_size, latent_dim, batch_size, input_dim);
+    
+    // Count parameters
+    int proj_params = input_dim * latent_dim + latent_dim * input_dim;
+    int encoder_attention_params = num_layers * 4 * d_model * d_model;
+    int encoder_mlp_params = num_layers * (d_model * hidden_dim + hidden_dim * d_model);
+    int decoder_attention_params = num_layers * 4 * d_model * d_model;
+    int decoder_mlp_params = num_layers * (d_model * hidden_dim + hidden_dim * d_model);
+    int codebook_params = num_codebook_vectors * d_model;
+    int total_params = proj_params + encoder_attention_params + encoder_mlp_params + 
+                       decoder_attention_params + decoder_mlp_params + codebook_params;
+    
+    printf("Parameters:\n");
+    printf("  Projections: %.2fM\n", proj_params / 1e6f);
+    printf("  Encoder: %.2fM (attention: %.2fM, mlp: %.2fM)\n", 
+           (encoder_attention_params + encoder_mlp_params) / 1e6f,
+           encoder_attention_params / 1e6f, encoder_mlp_params / 1e6f);
+    printf("  Decoder: %.2fM (attention: %.2fM, mlp: %.2fM)\n",
+           (decoder_attention_params + decoder_mlp_params) / 1e6f,
+           decoder_attention_params / 1e6f, decoder_mlp_params / 1e6f);
+    printf("  Codebook: %.2fM\n", codebook_params / 1e6f);
+    printf("  Total: %.2fM\n", total_params / 1e6f);
     
     // Training parameters
     const int num_epochs = 600;
-    const float learning_rate = 0.00001f;
+    const float learning_rate = 0.0001f;
     const int num_batches = num_images / batch_size;
     
     // Allocate device memory for batch data
@@ -108,7 +138,7 @@ int main(int argc, char* argv[]) {
             update_weights_vqvae(vqvae, learning_rate);
             
             // Print progress
-            if (batch % 5 == 0) {
+            if (batch % 10 == 0) {
                 printf("Epoch [%d/%d], Batch [%d/%d], Recon: %.4f, Commit: %.4f, Total: %.4f\n",
                        epoch, num_epochs, batch, num_batches,
                        losses[0], losses[1], losses[2]);
@@ -118,9 +148,9 @@ int main(int argc, char* argv[]) {
             if (batch > 0 && batch % 100 == 0) {
                 printf("--- Generating reconstructions (epoch %d, batch %d) ---\n", epoch, batch);
                 
-                // Get reconstructions from decoder output
+                // Get reconstructions
                 float* h_reconstructions = (float*)malloc(batch_size * input_dim * sizeof(float));
-                CHECK_CUDA(cudaMemcpy(h_reconstructions, vqvae->decoder->d_output, batch_size * input_dim * sizeof(float), cudaMemcpyDeviceToHost));
+                CHECK_CUDA(cudaMemcpy(h_reconstructions, vqvae->d_reconstructed, batch_size * input_dim * sizeof(float), cudaMemcpyDeviceToHost));
                 
                 // Save a few examples
                 for (int i = 0; i < 3; i++) {
