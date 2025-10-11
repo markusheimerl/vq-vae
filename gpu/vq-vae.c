@@ -1,32 +1,22 @@
 #include "vq-vae.h"
 
-// CUDA kernel for creating sinusoidal positional encoding
-__global__ static void create_positional_encoding_kernel(float* pos_encoding, int seq_len, int d_model) {
-    int pos = blockIdx.x;
-    int i = threadIdx.x;
-    
-    if (pos >= seq_len || i >= d_model) return;
-    
-    float angle = pos / powf(10000.0f, 2.0f * floorf(i / 2.0f) / (float)d_model);
-    
-    if (i % 2 == 0) {
-        pos_encoding[pos * d_model + i] = sinf(angle);
-    } else {
-        pos_encoding[pos * d_model + i] = cosf(angle);
-    }
-}
-
 // CUDA kernel for adding positional encoding
-__global__ static void add_positional_encoding_kernel(float* output, float* input, float* pos_encoding,
+__global__ static void add_positional_encoding_kernel(float* data,
                                                        int batch_size, int seq_len, int d_model) {
     int batch_idx = blockIdx.x;
     int pos = blockIdx.y;
-    int d = threadIdx.x;
     
-    if (batch_idx >= batch_size || pos >= seq_len || d >= d_model) return;
+    if (batch_idx >= batch_size || pos >= seq_len) return;
     
-    int idx = batch_idx * seq_len * d_model + pos * d_model + d;
-    output[idx] = input[idx] + pos_encoding[pos * d_model + d];
+    for (int d = threadIdx.x; d < d_model; d += blockDim.x) {
+        int idx = batch_idx * seq_len * d_model + pos * d_model + d;
+        
+        // Compute positional encoding on the fly
+        float angle = pos / powf(10000.0f, 2.0f * floorf(d / 2.0f) / (float)d_model);
+        float pos_enc = (d % 2 == 0) ? sinf(angle) : cosf(angle);
+        
+        data[idx] += pos_enc;
+    }
 }
 
 // CUDA kernel for vector quantization
@@ -262,10 +252,6 @@ VQVAE* init_vqvae(int input_dim, int latent_dim, int hidden_dim, int num_layers,
     free(h_input_proj_W);
     free(h_output_proj_W);
     
-    // Create positional encoding
-    CHECK_CUDA(cudaMalloc(&vqvae->d_pos_encoding, vqvae->seq_len * vqvae->d_model * sizeof(float)));
-    create_positional_encoding_kernel<<<vqvae->seq_len, vqvae->d_model>>>(vqvae->d_pos_encoding, vqvae->seq_len, vqvae->d_model);
-    
     // Allocate codebook
     int codebook_size = num_codebook_vectors * vqvae->code_dim;
     CHECK_CUDA(cudaMalloc(&vqvae->d_codebook, codebook_size * sizeof(float)));
@@ -286,21 +272,15 @@ VQVAE* init_vqvae(int input_dim, int latent_dim, int hidden_dim, int num_layers,
     
     // Allocate forward pass buffers
     CHECK_CUDA(cudaMalloc(&vqvae->d_projected_input, batch_size * latent_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&vqvae->d_encoder_input, batch_size * latent_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&vqvae->d_encoder_output, batch_size * latent_dim * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&vqvae->d_quantized, batch_size * latent_dim * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&vqvae->d_decoder_input, batch_size * latent_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&vqvae->d_decoder_output, batch_size * latent_dim * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&vqvae->d_reconstructed, batch_size * input_dim * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&vqvae->d_encoding_indices, batch_size * num_codes * sizeof(int)));
     
     // Allocate backward pass buffers
-    CHECK_CUDA(cudaMalloc(&vqvae->d_grad_decoder_output, batch_size * latent_dim * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&vqvae->d_grad_decoder_input, batch_size * latent_dim * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&vqvae->d_grad_quantized, batch_size * latent_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&vqvae->d_grad_encoder_output, batch_size * latent_dim * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&vqvae->d_grad_encoder_input, batch_size * latent_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&vqvae->d_grad_projected, batch_size * latent_dim * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&vqvae->d_grad_input, batch_size * input_dim * sizeof(float)));
     
     // Allocate loss buffers
@@ -339,24 +319,17 @@ void free_vqvae(VQVAE* vqvae) {
     cudaFree(vqvae->d_output_proj_grad);
     cudaFree(vqvae->d_output_proj_m);
     cudaFree(vqvae->d_output_proj_v);
-    cudaFree(vqvae->d_pos_encoding);
     cudaFree(vqvae->d_codebook);
     cudaFree(vqvae->d_codebook_ema_sum);
     cudaFree(vqvae->d_codebook_ema_count);
     cudaFree(vqvae->d_projected_input);
-    cudaFree(vqvae->d_encoder_input);
-    cudaFree(vqvae->d_encoder_output);
     cudaFree(vqvae->d_quantized);
     cudaFree(vqvae->d_decoder_input);
-    cudaFree(vqvae->d_decoder_output);
     cudaFree(vqvae->d_reconstructed);
     cudaFree(vqvae->d_encoding_indices);
-    cudaFree(vqvae->d_grad_decoder_output);
     cudaFree(vqvae->d_grad_decoder_input);
     cudaFree(vqvae->d_grad_quantized);
-    cudaFree(vqvae->d_grad_encoder_output);
     cudaFree(vqvae->d_grad_encoder_input);
-    cudaFree(vqvae->d_grad_projected);
     cudaFree(vqvae->d_grad_input);
     cudaFree(vqvae->d_commitment_loss);
     
@@ -380,33 +353,22 @@ void encode_vqvae(VQVAE* vqvae, float* d_input, int* d_indices) {
               vqvae->d_input_proj_W, vqvae->input_proj_weight_layout,
               &beta, vqvae->d_projected_input, vqvae->latent_layout);
     
-    // Copy to encoder input (will add pos encoding)
-    CHECK_CUDA(cudaMemcpy(vqvae->d_encoder_input, vqvae->d_projected_input, 
-                          vqvae->batch_size * vqvae->latent_dim * sizeof(float), 
-                          cudaMemcpyDeviceToDevice));
-    
     // Add positional encoding
     dim3 grid(vqvae->batch_size, vqvae->seq_len);
-    add_positional_encoding_kernel<<<grid, vqvae->d_model>>>(
-        vqvae->d_encoder_input, vqvae->d_encoder_input, vqvae->d_pos_encoding,
+    add_positional_encoding_kernel<<<grid, 256>>>(
+        vqvae->d_projected_input,
         vqvae->batch_size, vqvae->seq_len, vqvae->d_model
     );
     
     // Transformer encoder
-    forward_pass_transformer(vqvae->encoder, vqvae->d_encoder_input);
-    
-    // Copy encoder output
-    CHECK_CUDA(cudaMemcpy(vqvae->d_encoder_output, 
-                          vqvae->encoder->mlp_layers[vqvae->num_layers - 1]->d_output,
-                          vqvae->batch_size * vqvae->latent_dim * sizeof(float),
-                          cudaMemcpyDeviceToDevice));
+    forward_pass_transformer(vqvae->encoder, vqvae->d_projected_input);
     
     // Quantize
     dim3 quant_grid(vqvae->batch_size, vqvae->num_codes);
     int smem_size = vqvae->code_dim * sizeof(float) + 256 * (sizeof(float) + sizeof(int));
     quantize_kernel<<<quant_grid, 256, smem_size>>>(
         vqvae->d_quantized, d_indices,
-        vqvae->d_encoder_output, vqvae->d_codebook,
+        vqvae->encoder->mlp_layers[vqvae->num_layers - 1]->d_output, vqvae->d_codebook,
         vqvae->batch_size, vqvae->num_codes,
         vqvae->code_dim, vqvae->num_codebook_vectors
     );
@@ -427,15 +389,9 @@ void decode_vqvae(VQVAE* vqvae, int* d_indices, float* d_output) {
     // Transformer decoder
     forward_pass_transformer(vqvae->decoder, vqvae->d_decoder_input);
     
-    // Copy decoder output
-    CHECK_CUDA(cudaMemcpy(vqvae->d_decoder_output,
-                          vqvae->decoder->mlp_layers[vqvae->num_layers - 1]->d_output,
-                          vqvae->batch_size * vqvae->latent_dim * sizeof(float),
-                          cudaMemcpyDeviceToDevice));
-    
-    // Project output: [B x 4096] -> [B x 3072]
+    // Project output directly from decoder output: [B x 4096] -> [B x 3072]
     LT_MATMUL(vqvae, CUBLAS_OP_N, CUBLAS_OP_N, &alpha,
-              vqvae->d_decoder_output, vqvae->latent_layout,
+              vqvae->decoder->mlp_layers[vqvae->num_layers - 1]->d_output, vqvae->latent_layout,
               vqvae->d_output_proj_W, vqvae->output_proj_weight_layout,
               &beta, d_output, vqvae->input_layout);
 }
@@ -471,7 +427,7 @@ void calculate_losses_vqvae(VQVAE* vqvae, float* d_input, float* losses) {
     num_blocks = (total_latent + block_size - 1) / block_size;
     
     compute_commitment_loss_kernel<<<num_blocks, block_size>>>(
-        vqvae->d_encoder_output, vqvae->d_quantized,
+        vqvae->encoder->mlp_layers[vqvae->num_layers - 1]->d_output, vqvae->d_quantized,
         vqvae->d_commitment_loss, total_latent
     );
     
@@ -503,7 +459,7 @@ void backward_pass_vqvae(VQVAE* vqvae, float* d_input) {
     
     // Gradient of output projection
     LT_MATMUL(vqvae, CUBLAS_OP_T, CUBLAS_OP_N, &alpha,
-              vqvae->d_decoder_output, vqvae->latent_layout,
+              vqvae->decoder->mlp_layers[vqvae->num_layers - 1]->d_output, vqvae->latent_layout,
               vqvae->d_grad_input, vqvae->input_layout,
               &beta, vqvae->d_output_proj_grad, vqvae->output_proj_weight_layout);
     
@@ -511,13 +467,7 @@ void backward_pass_vqvae(VQVAE* vqvae, float* d_input) {
     LT_MATMUL(vqvae, CUBLAS_OP_N, CUBLAS_OP_T, &alpha,
               vqvae->d_grad_input, vqvae->input_layout,
               vqvae->d_output_proj_W, vqvae->output_proj_weight_layout,
-              &beta, vqvae->d_grad_decoder_output, vqvae->latent_layout);
-    
-    // Copy to decoder's gradient buffer
-    CHECK_CUDA(cudaMemcpy(vqvae->decoder->mlp_layers[vqvae->num_layers - 1]->d_grad_output,
-                          vqvae->d_grad_decoder_output,
-                          vqvae->batch_size * vqvae->latent_dim * sizeof(float),
-                          cudaMemcpyDeviceToDevice));
+              &beta, vqvae->decoder->mlp_layers[vqvae->num_layers - 1]->d_grad_output, vqvae->latent_layout);
     
     // Backward through decoder transformer
     backward_pass_transformer(vqvae->decoder, vqvae->d_decoder_input, vqvae->d_grad_decoder_input);
@@ -528,30 +478,18 @@ void backward_pass_vqvae(VQVAE* vqvae, float* d_input) {
     int num_blocks = (total_latent + block_size - 1) / block_size;
     
     straight_through_gradient_kernel<<<num_blocks, block_size>>>(
-        vqvae->d_grad_encoder_output, vqvae->d_grad_decoder_input,
-        vqvae->d_encoder_output, vqvae->d_quantized,
+        vqvae->encoder->mlp_layers[vqvae->num_layers - 1]->d_grad_output, vqvae->d_grad_decoder_input,
+        vqvae->encoder->mlp_layers[vqvae->num_layers - 1]->d_output, vqvae->d_quantized,
         vqvae->beta, total_latent
     );
     
-    // Copy to encoder's gradient buffer
-    CHECK_CUDA(cudaMemcpy(vqvae->encoder->mlp_layers[vqvae->num_layers - 1]->d_grad_output,
-                          vqvae->d_grad_encoder_output,
-                          vqvae->batch_size * vqvae->latent_dim * sizeof(float),
-                          cudaMemcpyDeviceToDevice));
-    
     // Backward through encoder transformer
-    backward_pass_transformer(vqvae->encoder, vqvae->d_encoder_input, vqvae->d_grad_encoder_input);
-    
-    // Gradient doesn't flow through positional encoding (it's fixed)
-    // So d_grad_projected = d_grad_encoder_input
-    CHECK_CUDA(cudaMemcpy(vqvae->d_grad_projected, vqvae->d_grad_encoder_input,
-                          vqvae->batch_size * vqvae->latent_dim * sizeof(float),
-                          cudaMemcpyDeviceToDevice));
+    backward_pass_transformer(vqvae->encoder, vqvae->d_projected_input, vqvae->d_grad_encoder_input);
     
     // Gradient of input projection
     LT_MATMUL(vqvae, CUBLAS_OP_T, CUBLAS_OP_N, &alpha,
               d_input, vqvae->input_layout,
-              vqvae->d_grad_projected, vqvae->latent_layout,
+              vqvae->d_grad_encoder_input, vqvae->latent_layout,
               &beta, vqvae->d_input_proj_grad, vqvae->input_proj_weight_layout);
 }
 
@@ -591,7 +529,7 @@ void update_weights_vqvae(VQVAE* vqvae, float learning_rate) {
     // EMA update for codebook
     ema_update_kernel<<<vqvae->num_codebook_vectors, vqvae->code_dim>>>(
         vqvae->d_codebook, vqvae->d_codebook_ema_sum, vqvae->d_codebook_ema_count,
-        vqvae->d_encoding_indices, vqvae->d_encoder_output,
+        vqvae->d_encoding_indices, vqvae->encoder->mlp_layers[vqvae->num_layers - 1]->d_output,
         vqvae->batch_size, vqvae->num_codes, vqvae->code_dim,
         vqvae->ema_decay, vqvae->epsilon
     );

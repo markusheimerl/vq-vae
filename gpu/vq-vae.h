@@ -64,9 +64,6 @@ typedef struct {
     float* d_output_proj_m;
     float* d_output_proj_v;
     
-    // Positional encoding
-    float* d_pos_encoding;      // [seq_len x d_model]
-    
     // Codebook parameters
     float* d_codebook;           // [num_codebook_vectors x code_dim]
     
@@ -78,21 +75,15 @@ typedef struct {
     
     // Forward pass buffers
     float* d_projected_input;    // [batch_size x latent_dim]
-    float* d_encoder_input;      // [batch_size x seq_len x d_model]
-    float* d_encoder_output;     // [batch_size x seq_len x d_model]
     float* d_quantized;          // [batch_size x latent_dim]
     float* d_decoder_input;      // [batch_size x seq_len x d_model]
-    float* d_decoder_output;     // [batch_size x seq_len x d_model]
     float* d_reconstructed;      // [batch_size x input_dim]
     int* d_encoding_indices;     // [batch_size x num_codes]
     
     // Backward pass buffers
-    float* d_grad_decoder_output; // [batch_size x seq_len x d_model]
     float* d_grad_decoder_input;  // [batch_size x seq_len x d_model]
-    float* d_grad_quantized;      // [batch_size x latent_dim]
-    float* d_grad_encoder_output; // [batch_size x seq_len x d_model]
     float* d_grad_encoder_input;  // [batch_size x seq_len x d_model]
-    float* d_grad_projected;      // [batch_size x latent_dim]
+    float* d_grad_quantized;      // [batch_size x latent_dim]
     float* d_grad_input;          // [batch_size x input_dim]
     
     // Loss computation buffers
