@@ -88,13 +88,31 @@ __global__ static void add_positional_encoding_kernel(float* data,
     
     if (batch_idx >= batch_size || pos >= seq_len) return;
     
+    // Calculate patch grid dimensions from seq_len (e.g., 64 patches = 8x8 grid)
+    int grid_size = (int)sqrtf((float)seq_len);
+    
+    // Convert 1D patch position to 2D patch coordinates
+    int patch_row = pos / grid_size;
+    int patch_col = pos % grid_size;
+    
     for (int d = threadIdx.x; d < d_model; d += blockDim.x) {
         int idx = batch_idx * seq_len * d_model + pos * d_model + d;
         
-        float angle = pos / powf(10000.0f, 2.0f * floorf(d / 2.0f) / (float)d_model);
-        float pos_enc = (d % 2 == 0) ? sinf(angle) : cosf(angle);
+        float encoding = 0.0f;
         
-        data[idx] += pos_enc;
+        // Split d_model into two halves for row and column encoding
+        if (d < d_model / 2) {
+            // First half: row (height) encoding
+            float angle = patch_row / powf(10000.0f, (2.0f * floorf(d / 2.0f)) / (float)(d_model / 2));
+            encoding = (d % 2 == 0) ? sinf(angle) : cosf(angle);
+        } else {
+            // Second half: column (width) encoding
+            int d_col = d - d_model / 2;
+            float angle = patch_col / powf(10000.0f, (2.0f * floorf(d_col / 2.0f)) / (float)(d_model / 2));
+            encoding = (d_col % 2 == 0) ? sinf(angle) : cosf(angle);
+        }
+        
+        data[idx] += encoding;
     }
 }
 
