@@ -7,7 +7,7 @@
 #include <math.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
-#include "../mlp/gpu/mlp.h"
+#include "../transformer/mlp/gpu/mlp.h"
 
 typedef struct {
     // Encoder and Decoder MLPs
